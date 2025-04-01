@@ -1,44 +1,22 @@
-# File: data_collection.py
-# Enhanced with better validation splitting and transition collection
+# TinyML Gesture Data Collection Script
 
-import os
-import cv2
+import serial
 import time
+import cv2
 import numpy as np
+import os
 import pandas as pd
 from datetime import datetime
 from tqdm import tqdm
-from pathlib import Path
-import shutil
+from serial.tools import list_ports
 
-def get_arduino_camera_settings():
-    """
-    Get the saved Arduino camera settings
-    Returns a dict with camera settings or None if file not found
-    """
-    if not os.path.exists('arduino_camera_settings.txt'):
-        return None
-    
-    settings = {}
-    with open('arduino_camera_settings.txt', 'r') as f:
-        for line in f:
-            key, value = line.strip().split('=')
-            try:
-                settings[key] = int(float(value))
-            except:
-                settings[key] = value
-    
-    return settings
-
+# Create necessary directories
 def create_project_directories():
     """Create necessary directories for the project"""
     dirs = [
         'data/raw/images',
-        'data/processed/images',
         'data/processed/features',
-        'data/validation',  # Added validation directory
-        'models',
-        'arduino_deploy'
+        'models'
     ]
     
     for directory in dirs:
@@ -46,60 +24,312 @@ def create_project_directories():
     
     print("Project directories created successfully")
 
-def setup_arduino_camera():
-    """
-    Initialize the Arduino OV5642 camera using saved settings
-    """
-    # Get saved settings
-    settings = get_arduino_camera_settings()
+def find_arduino_port():
+    """Find Arduino port by listing all available ports"""
+    ports = list(list_ports.comports())
     
-    if settings is None:
-        print("Arduino camera settings not found!")
-        print("Please run camera_test.py first to detect and configure your Arduino camera.")
+    print("\nAvailable ports:")
+    for i, port in enumerate(ports):
+        print(f"{i+1}: {port.device} - {port.description}")
+    
+    if not ports:
+        print("No serial ports found!")
         return None
     
-    camera_index = settings['index']
+    choice = input("\nSelect Arduino port number (or Enter for first port): ")
     
-    # Initialize camera
-    camera = cv2.VideoCapture(camera_index)
+    if choice.strip() == "":
+        return ports[0].device
     
-    if not camera.isOpened():
-        print(f"Error: Could not open Arduino camera with index {camera_index}.")
-        return None
-    
-    # Apply saved settings
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, settings['width'])
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, settings['height'])
-    # Some cameras support FPS setting, others don't
     try:
-        camera.set(cv2.CAP_PROP_FPS, settings['fps'])
+        index = int(choice) - 1
+        if 0 <= index < len(ports):
+            return ports[index].device
+        else:
+            print("Invalid selection, using first port")
+            return ports[0].device
     except:
-        pass
+        print("Invalid input, using first port")
+        return ports[0].device
+
+def connect_to_arduino(port=None, baud_rate=115200, timeout=5):
+    """Connect to Arduino with OV5642 camera"""
+    if port is None:
+        port = find_arduino_port()
+        if port is None:
+            print("No Arduino port found!")
+            return None
     
-    # Read a test frame to confirm camera is working
-    ret, frame = camera.read()
-    if not ret:
-        print("Error: Could not read frame from Arduino camera.")
-        camera.release()
+    try:
+        ser = serial.Serial(port, baud_rate, timeout=timeout)
+        print(f"Connected to Arduino on {port}")
+        time.sleep(2)  # Wait for Arduino to reset
+        
+        # Flush any data
+        ser.reset_input_buffer()
+        
+        return ser
+    except Exception as e:
+        print(f"Error connecting to Arduino: {e}")
+        return None
+
+def read_image_from_serial(ser, debug=False):
+    """
+    Highly robust image reading function that handles various JPEG formats
+    Returns the decoded image or None if failed
+    """
+    # Clear buffer first to ensure we're at the start of a new frame
+    ser.reset_input_buffer()
+    
+    # Send capture command
+    ser.write(b'c')
+    
+    # Wait for image data
+    start_time = time.time()
+    size = None
+    
+    # Step 1: Wait for IMG: marker
+    while time.time() - start_time < 5:  # 5 second timeout
+        try:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            if debug:
+                print(f"Read line: {line}")
+            
+            if line.startswith("IMG:"):
+                try:
+                    size = int(line.split(':')[1])
+                    if debug:
+                        print(f"Found image size: {size} bytes")
+                    break
+                except:
+                    if debug:
+                        print("Failed to parse image size")
+                    continue
+        except Exception as e:
+            if debug:
+                print(f"Error reading line: {e}")
+    
+    if size is None:
+        if debug:
+            print("Timeout waiting for image header")
         return None
     
-    print(f"Arduino camera initialized successfully:")
-    print(f"- Resolution: {settings['width']}x{settings['height']}")
-    print(f"- Target FPS: {settings['fps']}")
-    return camera
+    # Step 2: Read start marker
+    start_marker1 = ser.read(1)
+    start_marker2 = ser.read(1)
+    
+    if not start_marker1 or not start_marker2:
+        if debug:
+            print("Timeout reading start marker")
+        return None
+        
+    if start_marker1 != b'\xff' or start_marker2 != b'\xaa':
+        if debug:
+            print(f"Invalid start marker: {start_marker1.hex()} {start_marker2.hex()}")
+        return None
+    
+    if debug:
+        print("Found start marker (FF AA)")
+    
+    # Step 3: Read image data with careful handling of escape sequences
+    image_data = bytearray()
+    
+    start_time = time.time()
+    timeout = start_time + 15  # 15 second timeout
+    
+    # Read the raw data first
+    raw_data = bytearray()
+    bytes_read = 0
+    end_marker_found = False
+    
+    while time.time() < timeout and bytes_read < size + 1000:  # Add some margin
+        if ser.in_waiting > 0:
+            chunk = ser.read(ser.in_waiting)
+            raw_data.extend(chunk)
+            bytes_read += len(chunk)
+            
+            # Check if we've received the end marker (0xFF 0xBB) in the data
+            if len(raw_data) >= 2:
+                for i in range(len(raw_data) - 1):
+                    if raw_data[i] == 0xFF and raw_data[i + 1] == 0xBB:
+                        end_marker_found = True
+                        if debug:
+                            print(f"Found end marker after {i} bytes in raw data")
+                        break
+                if end_marker_found:
+                    break
+        else:
+            time.sleep(0.01)  # Short sleep to avoid tight loop
+    
+    if debug:
+        print(f"Read {len(raw_data)} bytes total")
+        
+    if not end_marker_found:
+        if debug:
+            print("End marker not found in data")
+            
+        # Save the raw data for inspection
+        with open('debug_raw_data.bin', 'wb') as f:
+            f.write(raw_data)
+        
+        return None
+    
+    # Now process the raw data to handle the escape sequences
+    i = 0
+    while i < len(raw_data):
+        # Check for end marker
+        if i < len(raw_data) - 1 and raw_data[i] == 0xFF and raw_data[i + 1] == 0xBB:
+            if debug:
+                print(f"Processed {len(image_data)} bytes before end marker")
+            break
+        
+        # Handle FF escape sequence
+        if i < len(raw_data) - 1 and raw_data[i] == 0xFF and raw_data[i + 1] == 0xFF:
+            image_data.append(0xFF)  # Add a single FF
+            i += 2  # Skip both FF bytes
+        else:
+            image_data.append(raw_data[i])  # Add the current byte
+            i += 1  # Move to next byte
+    
+    # Save both raw and processed data for debugging
+    if debug:
+        with open('debug_raw_image.bin', 'wb') as f:
+            f.write(raw_data)
+        with open('debug_processed_image.jpg', 'wb') as f:
+            f.write(image_data)
+        print(f"Saved raw and processed data files for debugging")
+    
+    # Check for valid JPEG header (FF D8)
+    if len(image_data) >= 2:
+        if image_data[0] == 0xFF and image_data[1] == 0xD8:
+            if debug:
+                print("JPEG header detected (FF D8)")
+        else:
+            if debug:
+                print(f"WARNING: First bytes are not JPEG header: {image_data[0]:02X} {image_data[1]:02X}")
+                
+            # Try to find JPEG start anywhere in the first 100 bytes
+            jpeg_start_idx = -1
+            for i in range(len(image_data) - 2):
+                if i > 100:  # Only check first 100 bytes
+                    break
+                if image_data[i] == 0xFF and image_data[i+1] == 0xD8:
+                    jpeg_start_idx = i
+                    if debug:
+                        print(f"Found JPEG header at position {i}")
+                    break
+            
+            if jpeg_start_idx >= 0:
+                # Trim data to start from JPEG header
+                image_data = image_data[jpeg_start_idx:]
+                if debug:
+                    print(f"Trimmed data to start from JPEG header, new size: {len(image_data)}")
+            else:
+                if debug:
+                    print("No JPEG header found in data, trying to add one")
+                # Add JPEG header if not found
+                header = bytearray(b'\xFF\xD8\xFF\xE0\x00\x10\x4A\x46\x49\x46\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00')
+                new_data = header + image_data
+                
+                # Save with added header
+                with open('debug_with_header.jpg', 'wb') as f:
+                    f.write(new_data)
+                
+                image_data = new_data
+    
+    # Step 5: Try multiple methods to decode the image
+    for attempt in range(3):
+        try:
+            if attempt == 0:
+                # First attempt: standard decoding
+                nparr = np.frombuffer(image_data, np.uint8)
+                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                if img is not None and img.size > 0:
+                    if debug:
+                        print(f"Successfully decoded image on attempt {attempt+1}: {img.shape}")
+                    return img
+                else:
+                    if debug:
+                        print(f"Attempt {attempt+1} failed: Empty or corrupted image")
+            
+            elif attempt == 1:
+                # Second attempt: Try to find and extract a valid JPEG segment
+                # Look for FF D8 (SOI) followed by FF E0 (APP0) or FF DB (DQT)
+                for i in range(len(image_data) - 4):
+                    if (image_data[i] == 0xFF and image_data[i+1] == 0xD8 and 
+                        image_data[i+2] == 0xFF and (image_data[i+3] == 0xE0 or image_data[i+3] == 0xDB)):
+                        fixed_data = image_data[i:]
+                        with open('debug_attempt2.jpg', 'wb') as f:
+                            f.write(fixed_data)
+                        
+                        nparr = np.frombuffer(fixed_data, np.uint8)
+                        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        
+                        if img is not None and img.size > 0:
+                            if debug:
+                                print(f"Successfully decoded image on attempt {attempt+1} after finding valid JPEG segment: {img.shape}")
+                            return img
+                
+                if debug:
+                    print(f"Attempt {attempt+1} failed: Could not find valid JPEG segment")
+            
+            elif attempt == 2:
+                # Third attempt: Try adding a completely new header
+                # This is a full JPEG header that works in many cases
+                header = bytearray([
+                    0xFF, 0xD8,                 # SOI marker
+                    0xFF, 0xE0, 0x00, 0x10,     # APP0 marker
+                    0x4A, 0x46, 0x49, 0x46, 0x00, # 'JFIF\0'
+                    0x01, 0x01,                 # version
+                    0x00,                       # units
+                    0x00, 0x01, 0x00, 0x01,     # density
+                    0x00, 0x00                  # thumbnail
+                ])
+                
+                # Try to find a good place to inject it (after any existing headers)
+                inject_point = 0
+                for i in range(min(100, len(image_data) - 2)):
+                    if image_data[i] == 0xFF and image_data[i+1] in [0xDB, 0xC0, 0xC4]:  # DQT, SOF, DHT markers
+                        inject_point = i
+                        break
+                
+                if inject_point > 0:
+                    fixed_data = header + image_data[inject_point:]
+                else:
+                    fixed_data = header + image_data
+                
+                with open('debug_attempt3.jpg', 'wb') as f:
+                    f.write(fixed_data)
+                
+                nparr = np.frombuffer(fixed_data, np.uint8)
+                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                if img is not None and img.size > 0:
+                    if debug:
+                        print(f"Successfully decoded image on attempt {attempt+1} with new header: {img.shape}")
+                    return img
+                else:
+                    if debug:
+                        print(f"Attempt {attempt+1} failed: Could not decode with new header")
+        
+        except Exception as e:
+            if debug:
+                print(f"Error in decoding attempt {attempt+1}: {e}")
+    
+    if debug:
+        print("All decoding attempts failed")
+    return None
 
-def collect_gesture_data(camera, num_samples=200, gesture_label=0, gesture_name="neutral", 
-                          show_countdown=True, preview_time=3):
+def collect_gesture_data(ser, num_samples=100, gesture_label=0, gesture_name="neutral"):
     """
     Collect image data for a specific gesture using Arduino camera
     
     Parameters:
-    camera: OpenCV camera object
+    ser: Serial connection to Arduino
     num_samples: Number of images to collect
     gesture_label: Numeric label for the gesture
     gesture_name: Name of the gesture for display
-    show_countdown: Whether to show countdown before collection
-    preview_time: How long to show preview before collecting data
     
     Returns:
     path to saved data directory
@@ -114,60 +344,47 @@ def collect_gesture_data(camera, num_samples=200, gesture_label=0, gesture_name=
     # Create metadata file
     metadata = []
     
-    # Preview window to help user position correctly
-    if preview_time > 0:
-        print(f"Preview window for {gesture_name}. Position yourself correctly.")
-        end_time = time.time() + preview_time
-        while time.time() < end_time:
-            ret, frame = camera.read()
-            if ret:
-                preview = frame.copy()
-                cv2.putText(preview, f"PREVIEW: {gesture_name}", (20, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(preview, f"Get ready... {int(end_time - time.time())}s", (20, 60), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.imshow("Data Collection Preview", preview)
-                cv2.waitKey(1)
+    print(f"Starting data collection for gesture: {gesture_name} (label {gesture_label})")
+    print("Get ready...")
     
     # Countdown
-    if show_countdown:
-        print(f"Starting data collection for gesture: {gesture_name} (label {gesture_label})")
-        print("Get ready...")
-        
-        for i in range(3, 0, -1):
-            print(f"{i}...")
-            time.sleep(1)
+    for i in range(3, 0, -1):
+        print(f"{i}...")
+        time.sleep(1)
     
     print("COLLECTING DATA - Perform the gesture continuously")
     
+    # Flag for first frame debug
+    first_frame = True
+    
     # Collect images
     for i in tqdm(range(num_samples)):
-        # Capture frame
-        ret, frame = camera.read()
+        # Capture frame from Arduino - only debug first frame
+        img = read_image_from_serial(ser, debug=first_frame)
+        first_frame = False
         
-        if ret:
+        if img is not None:
             # Save image
             timestamp = time.time()
             filename = f"{data_dir}/img_{i:04d}.jpg"
-            cv2.imwrite(filename, frame)
+            cv2.imwrite(filename, img)
             
             # Add to metadata
             metadata.append({
                 "filename": filename,
                 "timestamp": timestamp,
                 "label": gesture_label,
-                "gesture_name": gesture_name,
-                "frame_index": i
+                "gesture_name": gesture_name
             })
             
-            # Optional: Display frame with label
-            display_frame = frame.copy()
+            # Display frame with label
+            display_frame = img.copy()
             cv2.putText(display_frame, f"Recording: {gesture_name}", (20, 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.putText(display_frame, f"Frame: {i+1}/{num_samples}", (20, 60), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
-            # Add visual progress bar
+            # Add progress bar
             progress = int((i / num_samples) * display_frame.shape[1])
             cv2.rectangle(display_frame, (0, display_frame.shape[0] - 20), 
                          (progress, display_frame.shape[0]), (0, 255, 0), -1)
@@ -179,9 +396,13 @@ def collect_gesture_data(camera, num_samples=200, gesture_label=0, gesture_name=
                 print("Data collection interrupted!")
                 break
                 
-            # Adjust this delay if needed based on your camera's performance
-            time.sleep(0.1)  
-            
+            # Small delay between captures for stability
+            time.sleep(0.2)
+        else:
+            print(f"Failed to capture frame {i+1}, trying again")
+            i -= 1  # Try this frame again
+            time.sleep(0.5)  # Wait a bit before retrying
+    
     # Save metadata
     pd.DataFrame(metadata).to_csv(f"{data_dir}/metadata.csv", index=False)
     
@@ -190,12 +411,12 @@ def collect_gesture_data(camera, num_samples=200, gesture_label=0, gesture_name=
     
     return data_dir
 
-def collect_transition_data(camera, transition_name, from_gesture, to_gesture, num_samples=50):
+def collect_transition_data(ser, transition_name, from_gesture, to_gesture, num_samples=30):
     """
     Collect transition data between two gestures
     
     Parameters:
-    camera: OpenCV camera object
+    ser: Serial connection to Arduino
     transition_name: Name for this transition
     from_gesture: Starting gesture (name, label)
     to_gesture: Ending gesture (name, label)
@@ -224,43 +445,43 @@ def collect_transition_data(camera, transition_name, from_gesture, to_gesture, n
     
     print("COLLECTING TRANSITION - Move slowly and naturally")
     
+    # Debug only first frame
+    first_frame = True
+    
     # Collect transition images
     for i in tqdm(range(num_samples)):
         # Calculate interpolation factor (0.0 to 1.0)
         transition_factor = i / (num_samples - 1)
         
         # Capture frame
-        ret, frame = camera.read()
+        img = read_image_from_serial(ser, debug=first_frame)
+        first_frame = False
         
-        if ret:
+        if img is not None:
             # Save image
             timestamp = time.time()
             filename = f"{transition_dir}/transition_{i:04d}.jpg"
-            cv2.imwrite(filename, frame)
+            cv2.imwrite(filename, img)
             
-            # Create interpolated label
-            # For early frames, label as starting gesture
-            # For middle frames, create an intermediate "pre_" label if available
-            # For late frames, label as ending gesture
+            # Determine label based on transition factor
             if transition_factor < 0.3:
-                # Beginning of transition - label as 'from' gesture
+                # Beginning of transition
                 current_label = from_label
                 current_name = from_name
             elif transition_factor > 0.7:
-                # End of transition - label as 'to' gesture
+                # End of transition
                 current_label = to_label
                 current_name = to_name
             else:
-                # Middle of transition - if we have a 'pre_' label, use it
+                # Middle of transition - try to use a pre_gesture label if available
                 pre_name = f"pre_{to_name}"
                 if pre_name in [g for g, _ in AVAILABLE_GESTURES]:
                     pre_label = [l for g, l in AVAILABLE_GESTURES if g == pre_name][0]
                     current_label = pre_label
                     current_name = pre_name
                 else:
-                    # Otherwise, use a weighted label between from and to
-                    # This is just for metadata - the actual training will use the image
-                    current_label = from_label  # Simplified: use 'from' label
+                    # Default to from label
+                    current_label = from_label
                     current_name = f"transition_{from_name}_to_{to_name}"
             
             # Add to metadata
@@ -271,12 +492,11 @@ def collect_transition_data(camera, transition_name, from_gesture, to_gesture, n
                 "gesture_name": current_name,
                 "transition_factor": transition_factor,
                 "from_gesture": from_name,
-                "to_gesture": to_name,
-                "frame_index": i
+                "to_gesture": to_name
             })
             
             # Display frame with transition info
-            display_frame = frame.copy()
+            display_frame = img.copy()
             cv2.putText(display_frame, f"Transition: {from_name} → {to_name}", (20, 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.putText(display_frame, f"Progress: {int(transition_factor * 100)}%", (20, 60), 
@@ -294,8 +514,12 @@ def collect_transition_data(camera, transition_name, from_gesture, to_gesture, n
                 print("Transition collection interrupted!")
                 break
             
-            # Small delay to make collection smoother
-            time.sleep(0.1)
+            # Small delay for smoother collection
+            time.sleep(0.2)
+        else:
+            print(f"Failed to capture transition frame {i+1}, trying again")
+            i -= 1  # Try this frame again
+            time.sleep(0.5)  # Wait before retrying
     
     # Save metadata
     pd.DataFrame(metadata).to_csv(f"{transition_dir}/metadata.csv", index=False)
@@ -305,102 +529,16 @@ def collect_transition_data(camera, transition_name, from_gesture, to_gesture, n
     
     return transition_dir
 
-def create_validation_split(data_dirs, validation_percentage=20):
-    """
-    Create a validation split from collected data
-    
-    Parameters:
-    data_dirs: List of data directories
-    validation_percentage: Percentage of data to use for validation
-    
-    Returns:
-    List of validation directories
-    """
-    print(f"\nCreating validation split ({validation_percentage}%)...")
-    
-    validation_dirs = []
-    
-    for data_dir in data_dirs:
-        # Get metadata
-        metadata_file = os.path.join(data_dir, 'metadata.csv')
-        if not os.path.exists(metadata_file):
-            print(f"Warning: No metadata found for {data_dir}, skipping")
-            continue
-        
-        metadata = pd.read_csv(metadata_file)
-        
-        # Get gesture info from directory name
-        dir_name = os.path.basename(data_dir)
-        if 'transition' in dir_name:
-            # For transitions, use the last part of directory name
-            parts = dir_name.split('_')
-            if len(parts) >= 4:
-                gesture_name = parts[-1]  # Simplified - just use target gesture
-            else:
-                gesture_name = "transition"
-        else:
-            # For regular gestures, extract from directory name
-            parts = dir_name.split('_')
-            if len(parts) >= 2 and parts[-1].startswith('label'):
-                gesture_name = parts[-2]
-            else:
-                gesture_name = "unknown"
-        
-        # Create validation directory
-        validation_dir = f"data/validation/{gesture_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        os.makedirs(validation_dir, exist_ok=True)
-        
-        # Randomly select validation samples
-        total_samples = len(metadata)
-        validation_count = int(total_samples * validation_percentage / 100)
-        
-        # Get random indices for validation
-        validation_indices = np.random.choice(total_samples, validation_count, replace=False)
-        
-        # Copy validation files and create validation metadata
-        validation_metadata = []
-        
-        for idx in validation_indices:
-            # Get file info
-            file_info = metadata.iloc[idx]
-            src_file = file_info['filename']
-            
-            if not os.path.exists(src_file):
-                print(f"Warning: File {src_file} not found, skipping")
-                continue
-            
-            # Create destination filename
-            base_name = os.path.basename(src_file)
-            dst_file = os.path.join(validation_dir, base_name)
-            
-            # Copy file
-            shutil.copy2(src_file, dst_file)
-            
-            # Update metadata with new filename
-            file_info = file_info.copy()
-            file_info['filename'] = dst_file
-            validation_metadata.append(file_info)
-        
-        # Save validation metadata
-        pd.DataFrame(validation_metadata).to_csv(f"{validation_dir}/metadata.csv", index=False)
-        
-        print(f"Created validation split for {gesture_name}: {len(validation_metadata)} samples")
-        validation_dirs.append(validation_dir)
-    
-    return validation_dirs
-
 # Define available gestures
 AVAILABLE_GESTURES = [
     ('neutral', 0),
     ('turn_right', 1),
     ('turn_left', 2),
-    ('swipe_next', 3),
-    ('swipe_previous', 4),
-    ('pre_turn_right', 5),  # Predictive states - beginning to turn
-    ('pre_turn_left', 6)    # Predictive states - beginning to turn
+    ('pre_turn_right', 3),
+    ('pre_turn_left', 4)
 ]
 
-# Define important transitions to collect
+# Define important transitions
 IMPORTANT_TRANSITIONS = [
     ('neutral', 'pre_turn_right'),
     ('pre_turn_right', 'turn_right'),
@@ -410,21 +548,55 @@ IMPORTANT_TRANSITIONS = [
     ('turn_left', 'neutral')
 ]
 
+def optimize_camera_settings(ser):
+    """
+    Optimize camera settings for best results
+    """
+    print("Optimizing camera settings...")
+    
+    # Set camera to 320x240 resolution for best performance
+    ser.write(b'r')
+    time.sleep(0.1)
+    ser.write(b'0')  # 0 = 320x240
+    time.sleep(1.0)
+    
+    # Clear buffer
+    ser.reset_input_buffer()
+    
+    print("Camera set to 320x240 resolution")
+    return True
+
 def run_data_collection():
-    """Run the complete data collection process for all gestures using Arduino camera"""
+    """Run the complete data collection process"""
     create_project_directories()
     
-    # Initialize Arduino camera
-    camera = setup_arduino_camera()
-    if camera is None:
-        print("Please run camera_test.py first to configure the Arduino camera.")
+    # Connect to Arduino
+    ser = connect_to_arduino()
+    if ser is None:
+        print("Failed to connect to Arduino. Exiting.")
         return []
+    
+    # Optimize camera settings
+    optimize_camera_settings(ser)
+    
+    # Test capture to make sure everything is working
+    print("Taking test capture to verify camera...")
+    test_img = read_image_from_serial(ser, debug=True)
+    
+    if test_img is None:
+        print("Test capture failed! Please check camera connections.")
+        return []
+    else:
+        print("Test capture successful! Camera is working properly.")
+        cv2.imshow("Test Capture", test_img)
+        cv2.waitKey(1000)
+        cv2.destroyAllWindows()
     
     # Collect data for each gesture
     data_dirs = []
     
     try:
-        # First, collect data for each base gesture
+        # First collect basic gestures
         for gesture_name, gesture_label in AVAILABLE_GESTURES:
             print(f"\nPreparing to collect data for gesture: {gesture_name} (label {gesture_label})")
             print("Position yourself and press Enter when ready...")
@@ -432,11 +604,10 @@ def run_data_collection():
             
             # Collect data for this gesture
             data_dir = collect_gesture_data(
-                camera, 
-                num_samples=200,
+                ser, 
+                num_samples=100,  # 100 samples per gesture is a good starting point
                 gesture_label=gesture_label,
-                gesture_name=gesture_name,
-                preview_time=3  # Show preview window for 3 seconds
+                gesture_name=gesture_name
             )
             
             data_dirs.append(data_dir)
@@ -444,53 +615,58 @@ def run_data_collection():
             print(f"Completed collection for {gesture_name}. Take a short break...")
             time.sleep(3)
         
-        # Then collect transition data
-        for from_gesture_name, to_gesture_name in IMPORTANT_TRANSITIONS:
-            # Get labels for these gestures
-            from_label = next((label for name, label in AVAILABLE_GESTURES if name == from_gesture_name), None)
-            to_label = next((label for name, label in AVAILABLE_GESTURES if name == to_gesture_name), None)
-            
-            if from_label is None or to_label is None:
-                print(f"Warning: Could not find labels for transition {from_gesture_name} → {to_gesture_name}")
-                continue
-            
-            # Collect transition data
-            transition_dir = collect_transition_data(
-                camera,
-                f"{from_gesture_name}_to_{to_gesture_name}",
-                (from_gesture_name, from_label),
-                (to_gesture_name, to_label),
-                num_samples=50  # Collect 50 frames for each transition
-            )
-            
-            data_dirs.append(transition_dir)
-            
-            print(f"Completed transition collection. Take a short break...")
-            time.sleep(3)
+        # Then collect transition data (optional)
+        do_transitions = input("\nCollect transition data? (y/n): ").strip().lower() == 'y'
         
-        # Create validation split
-        validation_dirs = create_validation_split(data_dirs, validation_percentage=20)
-        print(f"Created {len(validation_dirs)} validation directories")
+        if do_transitions:
+            for from_gesture_name, to_gesture_name in IMPORTANT_TRANSITIONS:
+                # Get labels
+                from_label = next((label for name, label in AVAILABLE_GESTURES if name == from_gesture_name), None)
+                to_label = next((label for name, label in AVAILABLE_GESTURES if name == to_gesture_name), None)
+                
+                if from_label is None or to_label is None:
+                    print(f"Warning: Could not find labels for {from_gesture_name} → {to_gesture_name}")
+                    continue
+                
+                # Collect transition data
+                transition_dir = collect_transition_data(
+                    ser,
+                    f"{from_gesture_name}_to_{to_gesture_name}",
+                    (from_gesture_name, from_label),
+                    (to_gesture_name, to_label),
+                    num_samples=30  # 30 frames per transition
+                )
+                
+                data_dirs.append(transition_dir)
+                
+                print(f"Completed transition. Take a short break...")
+                time.sleep(3)
     
     finally:
-        # Release camera
-        camera.release()
+        # Close serial connection
+        ser.close()
         cv2.destroyAllWindows()
-        print("Data collection complete. Camera released.")
+        print("Data collection complete.")
     
     # Save list of all data directories
-    all_dirs = data_dirs.copy()
     with open('data/gesture_data_dirs.txt', 'w') as f:
-        for directory in all_dirs:
+        for directory in data_dirs:
             f.write(f"{directory}\n")
     
-    print(f"Data collection complete. Collected data in {len(all_dirs)} directories.")
-    return all_dirs
+    print(f"Data collection complete. Collected data in {len(data_dirs)} directories.")
+    return data_dirs
 
 if __name__ == "__main__":
-    print("Starting data collection with Arduino camera...")
-    data_dirs = run_data_collection()
-    if data_dirs:
-        print(f"Successfully collected data in {len(data_dirs)} directories.")
-    else:
-        print("Data collection failed or was interrupted.")
+    print("Starting TinyML gesture data collection...")
+    
+    try:
+        data_dirs = run_data_collection()
+        if data_dirs:
+            print(f"Successfully collected data in {len(data_dirs)} directories.")
+            print("\nNext step: Run model_training.py to train your gesture recognition model.")
+        else:
+            print("Data collection failed or was interrupted.")
+    except KeyboardInterrupt:
+        print("\nData collection interrupted by user.")
+    except Exception as e:
+        print(f"\nError during data collection: {e}")
