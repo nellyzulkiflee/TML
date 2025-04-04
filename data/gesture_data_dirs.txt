@@ -1,0 +1,3 @@
+data/raw/images/20250404_112255_neutral_label0
+data/raw/images/20250404_112531_turn_right_label1
+data/raw/images/20250404_112806_turn_left_label2

@@ -1,0 +1,12 @@
+SIMPLE Model Test Accuracy: 0.8250
+
+Classification Report:
+              precision    recall  f1-score   support
+
+     neutral       0.82      0.70      0.76        40
+   turn_left       0.72      0.78      0.75        37
+  turn_right       0.91      0.98      0.94        43
+
+    accuracy                           0.82       120
+   macro avg       0.82      0.82      0.82       120
+weighted avg       0.83      0.82      0.82       120
