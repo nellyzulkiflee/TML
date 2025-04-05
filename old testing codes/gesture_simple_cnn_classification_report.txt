@@ -1,0 +1,12 @@
+gesture_simple_cnn Eval
+Test Acc: 0.6429
+
+              precision    recall  f1-score   support
+
+     neutral     0.5618    0.7143    0.6289        70
+  swipe_left     0.6076    0.6857    0.6443        70
+ swipe_right     0.8810    0.5286    0.6607        70
+
+    accuracy                         0.6429       210
+   macro avg     0.6834    0.6429    0.6446       210
+weighted avg     0.6834    0.6429    0.6446       210

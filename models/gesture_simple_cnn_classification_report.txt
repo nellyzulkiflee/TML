@@ -1,0 +1,12 @@
+gesture_simple_cnn Eval
+Test Acc: 1.0000
+
+                  precision    recall  f1-score   support
+
+      background     1.0000    1.0000    1.0000        70
+left_two_fingers     1.0000    1.0000    1.0000        70
+right_one_finger     1.0000    1.0000    1.0000        70
+
+        accuracy                         1.0000       210
+       macro avg     1.0000    1.0000    1.0000       210
+    weighted avg     1.0000    1.0000    1.0000       210
