@@ -1,6 +1,4 @@
 # Arduino OV5642 Camera Controller with OpenCV
-# For hand gesture control project
-# camera_test.py
 
 import serial
 import time
